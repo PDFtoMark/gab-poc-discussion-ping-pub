@@ -1,0 +1,74 @@
+name: poc discussion slack injection
+
+on:
+  discussion:
+    types: [created]
+
+jobs:
+  send_message:
+    runs-on: ubuntu-latest
+    env:
+      discussion_url: ${{ github.event.discussion.html_url }}
+      discussion_number: ${{ github.event.discussion.number }}
+      discussion_title: ${{ github.event.discussion.title }}
+      discussion_author: ${{ github.event.discussion.user.login }}
+      discussion_repo: ${{ github.event.repository.full_name }}
+    steps:
+      - name: Start local webhook receiver
+        run: |
+          cat > /tmp/recv.py <<'PY'
+          import http.server
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  n = int(self.headers.get('content-length', 0))
+                  b = self.rfile.read(n)
+                  open('/tmp/recv.body','wb').write(b)
+                  self.send_response(200)
+                  self.send_header('Content-Type','application/json')
+                  self.end_headers()
+                  self.wfile.write(b'{"ok":true}')
+              def log_message(self,*a): pass
+          http.server.HTTPServer(('127.0.0.1',8099), H).serve_forever()
+          PY
+          nohup python3 /tmp/recv.py >/tmp/recv.log 2>&1 &
+          sleep 2
+
+      # Exact replica of WordPress/openverse .github/workflows/discussion_ping.yml,
+      # with the real SLACK_WEBHOOK_URL secret replaced by a local sink.
+      - name: Send notification for new discussion
+        id: slack
+        uses: slackapi/slack-github-action@v2
+        with:
+          webhook: http://127.0.0.1:8099/
+          webhook-type: incoming-webhook
+          payload: |
+            {
+             "text": "New discussion opened by ${{ env.discussion_author }} in ${{ env.discussion_repo }}: #${{ env.discussion_number }} - ${{ env.discussion_title }}",
+             "blocks": [
+               {
+                 "type": "section",
+                 "text": {
+                   "type": "mrkdwn",
+                   "text": ":github: New discussion opened by *${{ env.discussion_author }}* in ${{ env.discussion_repo }}:\n<${{ env.discussion_url }}|#${{ env.discussion_number }} - ${{ env.discussion_title }}>"
+                 }
+               }
+             ]
+            }
+
+      - name: Dump captured webhook body
+        if: always()
+        run: |
+          echo "=== BEGIN CAPTURED BODY ==="
+          cat /tmp/recv.body 2>/dev/null || echo "(nothing captured)"
+          echo
+          echo "=== END CAPTURED BODY ==="
+          python3 - <<'PY'
+          import json
+          raw = open('/tmp/recv.body','rb').read()
+          print("RAWLEN", len(raw))
+          d = json.loads(raw)
+          print("TOP KEYS:", sorted(d.keys()))
+          print("USERNAME:", d.get("username"))
+          print("ATTACHMENTS:", json.dumps(d.get("attachments")))
+          print("BLOCK0:", json.dumps(d["blocks"][0]))
+          PY
